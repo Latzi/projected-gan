@@ -273,7 +273,7 @@ def training_loop(
 
     # Train.
     if rank == 0:
-        print(f'Training for {total_kimg} kimg...")
+        print(f'Training for {total_kimg} kimg...')
         print()
     if num_gpus > 1:
         torch.distributed.broadcast(__CUR_NIMG__, 0)
