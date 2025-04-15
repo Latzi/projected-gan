@@ -43,16 +43,12 @@ def setup_snapshot_image_grid_NEW(training_set, random_seed=0):
        images: numpy array of shape [N, 3, H, W]
        labels: numpy array of shape [N, ...] (or empty if no labels)
     """
-    print("\n[DEBUG] Using the NEW setup_snapshot_image_grid_NEW function!")
-    traceback.print_stack(limit=25)
+    #print("\n[DEBUG] Using the NEW setup_snapshot_image_grid_NEW function!", flush=True)
+    #traceback.print_stack(limit=25)
     
     rnd = np.random.RandomState(random_seed)
-
-    # Determine grid dimensions.
     gw = np.clip(7680 // training_set.image_shape[2], 7, 32)
     gh = np.clip(4320 // training_set.image_shape[1], 4, 32)
-
-    # Gather random subset indices.
     all_indices = list(range(len(training_set)))
     rnd.shuffle(all_indices)
     grid_indices = [all_indices[i % len(all_indices)] for i in range(gw * gh)]
@@ -60,13 +56,13 @@ def setup_snapshot_image_grid_NEW(training_set, random_seed=0):
     images_list, labels_list = [], []
     for idx in grid_indices:
         img, lbl, bb = training_set[idx]  # Expect 3 items per sample.
-        if img.shape[0] == 4:  # If image has 4 channels, slice off the extra channel.
+        if img.shape[0] == 4:
             img = img[:3]
         images_list.append(img)
         labels_list.append(lbl)
-        # (The bb_mask is ignored for visualization.)
+        # (Ignore bb_mask for visualization.)
     
-    images = np.stack(images_list)   # Shape: [N, 3, H, W]
+    images = np.stack(images_list)
     labels = np.stack(labels_list)
     grid_size = (gw, gh)
     return grid_size, images, labels
@@ -85,10 +81,9 @@ def save_image_grid(img, fname, drange, grid_size):
     img = (img - lo) * (255 / (hi - lo))
     img = np.rint(img).clip(0, 255).astype(np.uint8)
 
-    gw, gh = grid_size
+    gw, gh = grid_size  # Must be a 2-tuple.
     _N, C, H, W = img.shape
 
-    # Reshape into grid.
     img = img.reshape([gh, gw, C, H, W])
     img = img.transpose(0, 3, 1, 4, 2)
     img = img.reshape([gh * H, gw * W, C])
@@ -101,36 +96,51 @@ def save_image_grid(img, fname, drange, grid_size):
 
 # ----------------------------------------------------------------------------
 def training_loop(
-    run_dir='.',                      # Output directory.
-    training_set_kwargs=None,         # Options for the dataset.
-    data_loader_kwargs=None,          # Options for DataLoader.
-    G_kwargs=None,                    # Generator network configuration.
-    D_kwargs=None,                    # Discriminator network configuration.
-    G_opt_kwargs=None,                # Generator optimizer configuration.
-    D_opt_kwargs=None,                # Discriminator optimizer configuration.
-    loss_kwargs=None,                 # Options for the loss function.
-    metrics=None,                     # List of metrics.
-    random_seed=0,                    # Global random seed.
-    num_gpus=1,                       # Number of GPUs.
-    rank=0,                           # Rank of this process.
-    batch_size=4,                     # Total batch size.
-    batch_gpu=4,                      # Batch size per GPU.
-    ema_kimg=10,                      # EMA half-life (in kimg).
-    ema_rampup=0.05,                  # EMA ramp-up coefficient.
-    G_reg_interval=None,              # G regularization interval.
-    D_reg_interval=16,                # D regularization interval.
-    total_kimg=25000,                 # Total training duration in kimg.
-    kimg_per_tick=4,                  # Snapshot interval (in kimg).
-    image_snapshot_ticks=50,          # Frequency (in ticks) of saving image snapshots.
-    network_snapshot_ticks=50,        # Frequency (in ticks) of saving network snapshots.
-    resume_pkl=None,                  # Path/URL to resume pickle.
-    resume_kimg=0,                    # Starting kimg when resuming.
-    cudnn_benchmark=True,             # Whether to enable torch.backends.cudnn.benchmark.
-    abort_fn=None,                    # Function to determine whether to abort training.
-    progress_fn=None,                 # Callback for progress reporting.
-    restart_every=-1,                 # Time (in seconds) after which to restart the process.
+    run_dir='.',
+    training_set_kwargs=None,
+    data_loader_kwargs=None,
+    G_kwargs=None,
+    D_kwargs=None,
+    G_opt_kwargs=None,
+    D_opt_kwargs=None,
+    loss_kwargs=None,
+    metrics=None,
+    random_seed=0,
+    num_gpus=1,
+    rank=0,
+    batch_size=4,
+    batch_gpu=4,
+    ema_kimg=10,
+    ema_rampup=0.05,
+    G_reg_interval=None,
+    D_reg_interval=16,
+    total_kimg=25000,
+    kimg_per_tick=4,
+    image_snapshot_ticks=50,
+    network_snapshot_ticks=50,
+    resume_pkl=None,
+    resume_kimg=0,
+    cudnn_benchmark=True,
+    abort_fn=None,
+    progress_fn=None,
+    restart_every=-1,
 ):
-    global np  # Ensure the global NumPy module is used.
+    if training_set_kwargs is None:
+        training_set_kwargs = {}
+    if data_loader_kwargs is None:
+        data_loader_kwargs = {}
+    if G_kwargs is None:
+        G_kwargs = {}
+    if D_kwargs is None:
+        D_kwargs = {}
+    if G_opt_kwargs is None:
+        G_opt_kwargs = {}
+    if D_opt_kwargs is None:
+        D_opt_kwargs = {}
+    if loss_kwargs is None:
+        loss_kwargs = {}
+    if metrics is None:
+        metrics = []
 
     start_time = time.time()
     device = torch.device('cuda', rank)
@@ -149,9 +159,8 @@ def training_loop(
     __PL_MEAN__ = torch.zeros([], device=device)
     best_fid = 9999
 
-    # Load training set.
     if rank == 0:
-        print('Loading training set...')
+        print('Loading training set...', flush=True)
     training_set = dnnlib.util.construct_class_by_name(**training_set_kwargs)
     training_set_sampler = misc.InfiniteSampler(dataset=training_set, rank=rank, num_replicas=num_gpus, seed=random_seed)
     training_set_iterator = iter(torch.utils.data.DataLoader(
@@ -162,31 +171,27 @@ def training_loop(
     ))
     if rank == 0:
         print()
-        print(f'Num images: {len(training_set)}')
-        print(f'Image shape: {training_set.image_shape}')
-        print(f'Label shape: {training_set.label_shape}')
+        print(f'Num images: {len(training_set)}', flush=True)
+        print(f'Image shape: {training_set.image_shape}', flush=True)
+        print(f'Label shape: {training_set.label_shape}', flush=True)
         print()
 
-    # Construct networks.
     if rank == 0:
-        print('Constructing networks...')
+        print('Constructing networks...', flush=True)
     common_kwargs = dict(
         c_dim=training_set.label_dim,
         img_resolution=training_set.resolution,
         img_channels=training_set.num_channels
     )
-    G = dnnlib.util.construct_class_by_name(**G_kwargs, **common_kwargs)\
-             .train().requires_grad_(False).to(device)
-    D = dnnlib.util.construct_class_by_name(**D_kwargs, **common_kwargs)\
-             .train().requires_grad_(False).to(device)
+    G = dnnlib.util.construct_class_by_name(**G_kwargs, **common_kwargs).train().requires_grad_(False).to(device)
+    D = dnnlib.util.construct_class_by_name(**D_kwargs, **common_kwargs).train().requires_grad_(False).to(device)
     G_ema = copy.deepcopy(G).eval()
 
-    # Resume checkpoint if available.
     ckpt_pkl = None
     if restart_every > 0 and os.path.isfile(misc.get_ckpt_path(run_dir)):
         ckpt_pkl = resume_pkl = misc.get_ckpt_path(run_dir)
     if (resume_pkl is not None) and (rank == 0):
-        print(f'Resuming from "{resume_pkl}"')
+        print(f'Resuming from "{resume_pkl}"', flush=True)
         with dnnlib.util.open_url(resume_pkl) as f:
             resume_data = legacy.load_network_pkl(f)
         for name, module in [('G', G), ('D', D), ('G_ema', G_ema)]:
@@ -205,17 +210,15 @@ def training_loop(
         img = misc.print_module_summary(G, [z, c])
         misc.print_module_summary(D, [img, c])
 
-    # Distribute networks across GPUs.
     if rank == 0:
-        print(f'Distributing across {num_gpus} GPUs...')
+        print(f'Distributing across {num_gpus} GPUs...', flush=True)
     for module in [G, D, G_ema]:
         if module is not None and num_gpus > 1:
             for param in misc.params_and_buffers(module):
                 torch.distributed.broadcast(param, src=0)
 
-    # Setup training phases.
     if rank == 0:
-        print('Setting up training phases...')
+        print('Setting up training phases...', flush=True)
     loss = dnnlib.util.construct_class_by_name(device=device, G=G, G_ema=G_ema, D=D, **loss_kwargs)
     phases = []
     for name, module, opt_kwargs, reg_interval in [
@@ -241,9 +244,9 @@ def training_loop(
             phase.end_event = torch.cuda.Event(enable_timing=True)
 
     # -------------------------------------------------------------------------
-    # Export sample images (real images and initial fake images).
+    # Export sample images.
     if rank == 0:
-        print('Exporting sample images...')
+        print('Exporting sample images...', flush=True)
         grid_size, real_images, real_labels = setup_snapshot_image_grid_NEW(training_set, random_seed=random_seed)
         save_image_grid(real_images, os.path.join(run_dir, 'reals.png'), drange=[0, 255], grid_size=grid_size)
         
@@ -259,15 +262,15 @@ def training_loop(
                 out = out[:, :3]
             out_images_list.append(out)
         fake_images_tensor = torch.cat(out_images_list).detach().cpu()
-        fake_images_init = np.asarray(fake_images_tensor)
-        print(f"[DEBUG] fake_images_init shape: {fake_images_init.shape}, dtype: {fake_images_init.dtype}")
+        fake_images_init = fake_images_tensor.numpy()
+        print(f"[DEBUG] fake_images_init shape: {fake_images_init.shape}, dtype: {fake_images_init.dtype}", flush=True)
         save_image_grid(fake_images_init, os.path.join(run_dir, 'fakes_init.png'),
                         drange=[-1, 1], grid_size=grid_size)
 
     # -------------------------------------------------------------------------
     # Initialize logs.
     if rank == 0:
-        print('Initializing logs...')
+        print('Initializing logs...', flush=True)
     stats_collector = training_stats.Collector(regex='.*')
     stats_metrics = {}
     stats_jsonl = None
@@ -277,13 +280,14 @@ def training_loop(
         try:
             import torch.utils.tensorboard as tensorboard
             stats_tfevents = tensorboard.SummaryWriter(run_dir)
-        except ImportError as err:
-            print('Skipping tfevents export:', err)
+        except Exception as err:
+            print('Skipping tfevents export:', err, flush=True)
+            stats_tfevents = None
 
     # -------------------------------------------------------------------------
     # Training loop setup.
     if rank == 0:
-        print(f'Training for {total_kimg} kimg...\n')
+        print(f'Training for {total_kimg} kimg...\n', flush=True)
     if num_gpus > 1:
         torch.distributed.broadcast(__CUR_NIMG__, 0)
         torch.distributed.broadcast(__CUR_TICK__, 0)
@@ -374,43 +378,36 @@ def training_loop(
         
         tick_end_time = time.time()
         maintenance_time = tick_end_time - tick_start_time
-        fields = []
-        fields += [f"tick {training_stats.report0('Progress/tick', cur_tick):<5d}"]
-        fields += [f"kimg {training_stats.report0('Progress/kimg', cur_nimg / 1e3):<8.1f}"]
-        fields += [f"time {dnnlib.util.format_time(training_stats.report0('Timing/total_sec', tick_end_time - start_time)):<12s}"]
-        fields += [f"sec/tick {training_stats.report0('Timing/sec_per_tick', tick_end_time - tick_start_time):<7.1f}"]
-        fields += [f"sec/kimg {training_stats.report0('Timing/sec_per_kimg', (tick_end_time - tick_start_time) / (cur_nimg - tick_start_nimg) * 1e3):<7.2f}"]
-        fields += [f"maintenance {training_stats.report0('Timing/maintenance_sec', maintenance_time):<6.1f}"]
-        fields += [f"cpumem {training_stats.report0('Resources/cpu_mem_gb', psutil.Process(os.getpid()).memory_info().rss / 2**30):<6.2f}"]
-        fields += [f"gpumem {training_stats.report0('Resources/peak_gpu_mem_gb', torch.cuda.max_memory_allocated(device) / 2**30):<6.2f}"]
-        fields += [f"reserved {training_stats.report0('Resources/peak_gpu_mem_reserved_gb', torch.cuda.max_memory_reserved(device) / 2**30):<6.2f}"]
-        torch.cuda.reset_peak_memory_stats()
-        training_stats.report0('Timing/total_hours', (tick_end_time - start_time) / 3600)
-        training_stats.report0('Timing/total_days', (tick_end_time - start_time) / (24 * 3600))
+
+        # --- Debug: print the progress for each tick.
         if rank == 0:
-            print(' '.join(fields))
+            print(f"[DEBUG] Tick {cur_tick}: cur_nimg = {cur_nimg}, sec/tick = {tick_end_time - tick_start_time:.2f}", flush=True)
         
-        if (not done) and abort_fn is not None and abort_fn():
-            done = True
-            if rank == 0:
-                print('\nAborting...')
-        if (rank == 0) and (restart_every > 0) and ((time.time() - start_time) > restart_every):
-            print('Restart job...')
-            __RESTART__ = torch.tensor(1., device=device)
-        if num_gpus > 1:
-            torch.distributed.broadcast(__RESTART__, 0)
-        if __RESTART__:
-            done = True
-            if rank == 0:
-                print(f'Process {rank} leaving...')
-            if num_gpus > 1:
-                torch.distributed.barrier()
+        stats_collector.update()
+        stats_dict = stats_collector.as_dict()
         
+        timestamp = time.time()
+        if stats_jsonl is not None:
+            fields = dict(stats_dict, timestamp=timestamp)
+            stats_jsonl.write(json.dumps(fields) + '\n')
+            stats_jsonl.flush()
+        if stats_tfevents is not None:
+            global_step = int(cur_nimg / 1e3)
+            walltime = timestamp - start_time
+            for name, val in stats_dict.items():
+                stats_tfevents.add_scalar(name, val.mean, global_step=global_step, walltime=walltime)
+            for name, val in stats_metrics.items():
+                stats_tfevents.add_scalar(f'Metrics/{name}', val, global_step=global_step, walltime=walltime)
+            stats_tfevents.flush()
+        if progress_fn is not None:
+            progress_fn(cur_nimg // 1000, total_kimg)
+        
+        # Save image snapshots and network checkpoints at the desired tick intervals.
         if (rank == 0) and (image_snapshot_ticks is not None) and (done or cur_tick % image_snapshot_ticks == 0):
             gw, gh = grid_size
             n_images = gw * gh
             z_batches = torch.randn([n_images, G.z_dim], device=device).split(batch_gpu)
-            c_batches = torch.zeros([n_images, G.c_dim], device=device).split(batch_gpu)
+            c_batches = torch.zeros([n_images, G.c_dim], device=device).split(batch_gpu)  # dummy labels for unconditional G
             out_list = []
             for z_b, c_b in zip(z_batches, c_batches):
                 fake_b = G_ema(z=z_b, c=c_b, noise_mode='const').cpu()
@@ -419,7 +416,7 @@ def training_loop(
                 out_list.append(fake_b)
             fakes = torch.cat(out_list).detach().cpu()
             fakes_np = np.asarray(fakes)
-            print(f"[DEBUG] fakes_np shape: {fakes_np.shape}, dtype: {fakes_np.dtype}")
+            print(f"[DEBUG] fakes_np shape: {fakes_np.shape}, dtype: {fakes_np.dtype}", flush=True)
             save_image_grid(fakes_np, os.path.join(run_dir, f'fakes{cur_nimg//1000:06d}.png'),
                             drange=[-1, 1], grid_size=grid_size)
         
@@ -438,7 +435,8 @@ def training_loop(
                 del value
         
         if (rank == 0) and (restart_every > 0) and (network_snapshot_ticks is not None) and (snapshot_data is not None):
-            snapshot_pkl = misc.get_ckpt_path(run_dir)
+            #snapshot_pkl = misc.get_ckpt_path(run_dir)
+            snapshot_pkl = os.path.join(run_dir, f'network-snapshot-{cur_nimg//1000:06d}.pkl')
             snapshot_data['progress'] = {
                 'cur_nimg': torch.LongTensor([cur_nimg]),
                 'cur_tick': torch.LongTensor([cur_tick]),
@@ -449,10 +447,11 @@ def training_loop(
                 snapshot_data['progress']['pl_mean'] = loss.pl_mean.cpu()
             with open(snapshot_pkl, 'wb') as f:
                 pickle.dump(snapshot_data, f)
+            print(f"[DEBUG] Saved network snapshot to {snapshot_pkl}", flush=True)
         
         if cur_tick and (snapshot_data is not None) and (len(metrics) > 0):
             if rank == 0:
-                print('Evaluating metrics...')
+                print('Evaluating metrics...', flush=True)
             for metric in metrics:
                 result_dict = metric_main.calc_metric(
                     metric=metric,
@@ -476,6 +475,7 @@ def training_loop(
                         dill.dump(snapshot_data, f)
                     with open(cur_nimg_txt, 'w') as f:
                         f.write(str(cur_nimg))
+                    print(f"[DEBUG] Saved best model checkpoint to {snapshot_pkl}", flush=True)
         
         del snapshot_data
         
@@ -485,25 +485,10 @@ def training_loop(
                 phase.end_event.synchronize()
                 value = phase.start_event.elapsed_time(phase.end_event)
             training_stats.report0('Timing/' + phase.name, value)
-        stats_collector.update()
-        stats_dict = stats_collector.as_dict()
         
-        timestamp = time.time()
-        if stats_jsonl is not None:
-            fields = dict(stats_dict, timestamp=timestamp)
-            stats_jsonl.write(json.dumps(fields) + '\n')
-            stats_jsonl.flush()
-        if stats_tfevents is not None:
-            global_step = int(cur_nimg / 1e3)
-            walltime = timestamp - start_time
-            for name, val in stats_dict.items():
-                stats_tfevents.add_scalar(name, val.mean, global_step=global_step, walltime=walltime)
-            for name, val in stats_metrics.items():
-                stats_tfevents.add_scalar(f'Metrics/{name}', val, global_step=global_step, walltime=walltime)
-            stats_tfevents.flush()
-        
-        if progress_fn is not None:
-            progress_fn(cur_nimg // 1000, total_kimg)
+        # --- Add an extra tick print here to see the tick update.
+        if rank == 0:
+            print(f"[DEBUG] End of Tick {cur_tick}: Total images processed: {cur_nimg//1000:.1f} kimg", flush=True)
         
         cur_tick += 1
         tick_start_nimg = cur_nimg
@@ -513,4 +498,4 @@ def training_loop(
             break
         
     if rank == 0:
-        print('\nExiting...')
+        print('\nExiting...', flush=True)
