@@ -1,225 +1,170 @@
-# discriminator.py
-# -----------------------------------------------------------------------------
-# Minimal changes to handle an extra bounding‐box channel (or channels).
-# -----------------------------------------------------------------------------
+# gen_images.py
+# ----------------------------------------------------------------------------
+# Modified to optionally provide a bounding‐box mask to the generator.
+# If a directory is provided for the bounding‐box mask, different mask files
+# are used for different seeds (cycled through if necessary).
+# ----------------------------------------------------------------------------
 
-from functools import partial
+import os
+import re
+from typing import List, Optional, Tuple, Union
+
+import click
+import dnnlib
 import numpy as np
+import PIL.Image
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
-from pg_modules.blocks import DownBlock, DownBlockPatch, conv2d
-from pg_modules.projector import F_RandomProj
-from pg_modules.diffaug import DiffAugment
+import legacy
 
-
-class SingleDisc(nn.Module):
-    def __init__(self, nc=None, ndf=None, start_sz=256, end_sz=8,
-                 head=None, separable=False, patch=False):
-        super().__init__()
-        channel_dict = {
-            4: 512, 8: 512, 16: 256, 32: 128,
-            64: 64, 128: 64, 256: 32, 512: 16, 1024: 8
-        }
-
-        # Interpolate for start_sz not in channel_dict
-        if start_sz not in channel_dict.keys():
-            sizes = np.array(list(channel_dict.keys()))
-            start_sz = sizes[np.argmin(abs(sizes - start_sz))]
-        self.start_sz = start_sz
-
-        # If given ndf, allocate all layers with the same ndf
-        if ndf is None:
-            nfc = channel_dict
+# ----------------------------------------------------------------------------
+def parse_range(s: Union[str, List]) -> List[int]:
+    """Parse a comma separated list of numbers or ranges and return a list of ints.
+       e.g. '1,2,5-10' => [1, 2, 5, 6, 7, 8, 9, 10]
+    """
+    if isinstance(s, list):
+        return s
+    ranges = []
+    range_re = re.compile(r'^(\d+)-(\d+)$')
+    for p in s.split(','):
+        m = range_re.match(p)
+        if m:
+            ranges.extend(range(int(m.group(1)), int(m.group(2)) + 1))
         else:
-            nfc = {k: ndf for k, v in channel_dict.items()}
+            ranges.append(int(p))
+    return ranges
 
-        # For feature map discriminators with nfc not in channel_dict (e.g. pretrained backbone)
-        if nc is not None and head is None:
-            nfc[start_sz] = nc
+# ----------------------------------------------------------------------------
+def parse_vec2(s: Union[str, Tuple[float, float]]) -> Tuple[float, float]:
+    """Parse a floating point 2-vector of syntax 'a,b'. e.g. '0,1' => (0,1)."""
+    if isinstance(s, tuple):
+        return s
+    parts = s.split(',')
+    if len(parts) == 2:
+        return (float(parts[0]), float(parts[1]))
+    raise ValueError(f'cannot parse 2-vector {s}')
 
-        layers = []
-        if head:
-            layers += [
-                conv2d(nc, nfc[256], 3, 1, 1, bias=False),
-                nn.LeakyReLU(0.2, inplace=True)
-            ]
-
-        # Down Blocks.
-        DB = partial(DownBlockPatch, separable=separable) if patch else partial(DownBlock, separable=separable)
-        while start_sz > end_sz:
-            layers.append(DB(nfc[start_sz], nfc[start_sz // 2]))
-            start_sz = start_sz // 2
-
-        layers.append(conv2d(nfc[end_sz], 1, 4, 1, 0, bias=False))
-        self.main = nn.Sequential(*layers)
-
-    def forward(self, x, c):
-        return self.main(x)
-
-
-class SingleDiscCond(nn.Module):
-    def __init__(self, nc=None, ndf=None, start_sz=256, end_sz=8,
-                 head=None, separable=False, patch=False,
-                 c_dim=1000, cmap_dim=64, embedding_dim=128):
-        super().__init__()
-        self.cmap_dim = cmap_dim
-
-        channel_dict = {
-            4: 512, 8: 512, 16: 256, 32: 128,
-            64: 64, 128: 64, 256: 32, 512: 16, 1024: 8
-        }
-
-        if start_sz not in channel_dict.keys():
-            sizes = np.array(list(channel_dict.keys()))
-            start_sz = sizes[np.argmin(abs(sizes - start_sz))]
-        self.start_sz = start_sz
-
-        if ndf is None:
-            nfc = channel_dict
-        else:
-            nfc = {k: ndf for k, v in channel_dict.items()}
-
-        if nc is not None and head is None:
-            nfc[start_sz] = nc
-
-        layers = []
-        if head:
-            layers += [
-                conv2d(nc, nfc[256], 3, 1, 1, bias=False),
-                nn.LeakyReLU(0.2, inplace=True)
-            ]
-
-        DB = partial(DownBlockPatch, separable=separable) if patch else partial(DownBlock, separable=separable)
-        while start_sz > end_sz:
-            layers.append(DB(nfc[start_sz], nfc[start_sz // 2]))
-            start_sz = start_sz // 2
-        self.main = nn.Sequential(*layers)
-
-        # Additional class conditioning.
-        self.cls = conv2d(nfc[end_sz], self.cmap_dim, 4, 1, 0, bias=False)
-        self.embed = nn.Embedding(num_embeddings=c_dim, embedding_dim=embedding_dim)
-        self.embed_proj = nn.Sequential(
-            nn.Linear(self.embed.embedding_dim, self.cmap_dim),
-            nn.LeakyReLU(0.2, inplace=True),
-        )
-
-    def forward(self, x, c):
-        h = self.main(x)
-        out = self.cls(h)
-
-        # Projection.
-        cmap = self.embed_proj(self.embed(c.argmax(1))).unsqueeze(-1).unsqueeze(-1)
-        out = (out * cmap).sum(dim=1, keepdim=True) * (1 / np.sqrt(self.cmap_dim))
-        return out
-
-
-class MultiScaleD(nn.Module):
+# ----------------------------------------------------------------------------
+def make_transform(translate: Tuple[float, float], angle: float):
     """
-    The multi-scale sub-discriminators, each operating on a different scale.
+    Create a 3x3 affine transformation matrix for translation and rotation.
+    The matrix returned is of type float32.
     """
-    def __init__(self, channels, resolutions, num_discs=1,
-                 proj_type=2,  # 0 = no projection, 1 = cross-channel mixing, 2 = cross-scale mixing
-                 cond=0, separable=False, patch=False, **kwargs):
-        super().__init__()
-        assert num_discs in [1, 2, 3, 4]
+    m = np.eye(3, dtype=np.float32)
+    s = np.sin(angle / 360.0 * np.pi * 2)
+    c = np.cos(angle / 360.0 * np.pi * 2)
+    m[0, 0] = c
+    m[0, 1] = s
+    m[0, 2] = translate[0]
+    m[1, 0] = -s
+    m[1, 1] = c
+    m[1, 2] = translate[1]
+    return m
 
-        self.disc_in_channels = channels[:num_discs]
-        self.disc_in_res = resolutions[:num_discs]
-        Disc = SingleDiscCond if cond else SingleDisc
-
-        mini_discs = []
-        for i, (cin, res) in enumerate(zip(self.disc_in_channels, self.disc_in_res)):
-            start_sz = res if not patch else 16
-            disc_i = Disc(nc=cin, start_sz=start_sz, end_sz=8, separable=separable, patch=patch)
-            mini_discs.append((str(i), disc_i))
-        self.mini_discs = nn.ModuleDict(mini_discs)
-
-    def forward(self, features, c):
-        all_logits = []
-        for k, disc in self.mini_discs.items():
-            logits_k = disc(features[k], c)
-            all_logits.append(logits_k.view(features[k].size(0), -1))
-        all_logits = torch.cat(all_logits, dim=1)
-        return all_logits
-
-
-class ProjectedDiscriminator(nn.Module):
+# ----------------------------------------------------------------------------
+@click.command()
+@click.option('--network', 'network_pkl', help='Network pickle filename', required=True)
+@click.option('--seeds', type=parse_range, help='List of random seeds (e.g. "0,1,4-6")', required=True)
+@click.option('--trunc', 'truncation_psi', type=float, default=1, show_default=True, help='Truncation psi')
+@click.option('--class', 'class_idx', type=int, default=None, help='Class label (unconditional if not specified)')
+@click.option('--noise-mode', type=click.Choice(['const', 'random', 'none']), default='const', show_default=True, help='Noise mode')
+@click.option('--translate', type=parse_vec2, default='0,0', show_default=True, metavar='VEC2', help='Translate XY-coordinate (e.g. "0.3,1")')
+@click.option('--rotate', type=float, default=0, show_default=True, metavar='ANGLE', help='Rotation angle in degrees')
+@click.option('--bbox-mask', 'bbox_mask_path', type=str, default=None, help='Path to a bounding box mask PNG file or directory (grayscale). Must match the generator resolution.')
+@click.option('--outdir', type=str, required=True, metavar='DIR', help='Where to save the output images')
+def generate_images(
+    network_pkl: str,
+    seeds: List[int],
+    truncation_psi: float,
+    noise_mode: str,
+    outdir: str,
+    translate: Tuple[float, float],
+    rotate: float,
+    class_idx: Optional[int],
+    bbox_mask_path: Optional[str]
+):
     """
-    The main Projected Discriminator that:
-      1) Optionally applies DiffAugment.
-      2) Optionally interpolates the input to 224×224.
-      3) Extracts feature maps via a pretrained backbone.
-      4) Merges extra bounding-box channels if provided.
-      5) Feeds the features to multi-scale sub-discriminators.
+    Generate images using a pretrained network.
+
+    Example usages:
+      python gen_images.py --network=path/to/net.pkl --seeds=0-5 --outdir=out
+      python gen_images.py --network=net.pkl --seeds=42 --bbox-mask=path/to/mask.png --outdir=out
+      python gen_images.py --network=net.pkl --seeds=42 --bbox-mask=path/to/mask_directory --outdir=out
     """
-    def __init__(self, diffaug=True, interp224=True, backbone_kwargs={}, extra_channels=1, **kwargs):
-        super().__init__()
-        self.diffaug = diffaug
-        self.interp224 = interp224
-        # extra_channels: number of extra bounding box channels appended to the RGB image.
-        self.extra_channels = extra_channels
+    print(f'Loading networks from "{network_pkl}"...')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    with dnnlib.util.open_url(network_pkl) as f:
+        G = legacy.load_network_pkl(f)['G_ema'].to(device)  # type: ignore
 
-        # Set up a 1×1 conv to map extra bounding-box channels into 3 channels.
-        # (If you want to concatenate instead of add, adjust accordingly.)
-        if self.extra_channels > 0:
-            self.bb_conv = nn.Conv2d(self.extra_channels, 3, kernel_size=1)
-        else:
-            self.bb_conv = None
+    os.makedirs(outdir, exist_ok=True)
+    print(f'Output directory: {os.path.abspath(outdir)}')
 
-        # Pretrained feature network for extracting features.
-        self.feature_network = F_RandomProj(**backbone_kwargs)
+    # If conditional, prepare label.
+    label = torch.zeros([1, G.c_dim], device=device)
+    if G.c_dim != 0:
+        if class_idx is None:
+            raise click.ClickException('--class=lbl must be specified for a conditional network')
+        label[0, class_idx] = 1
+    else:
+        if class_idx is not None:
+            print('Note: --class=lbl is ignored for an unconditional network.')
 
-        # Multi-scale discriminators.
-        self.discriminator = MultiScaleD(
-            channels=self.feature_network.CHANNELS,
-            resolutions=self.feature_network.RESOLUTIONS,
-            **backbone_kwargs,
-        )
-
-    def train(self, mode=True):
-        # Force the feature network to evaluation mode.
-        self.feature_network = self.feature_network.train(False)
-        self.discriminator = self.discriminator.train(mode)
-        return self
-
-    def eval(self):
-        return self.train(False)
-
-    def forward(self, x, c):
-        """
-        x: Tensor of shape [N, 3 + extra_channels, H, W]
-        c: Conditioning labels (unused or used in conditional discriminators).
-        """
-        # Optionally apply DiffAugment.
-        if self.diffaug:
-            x = DiffAugment(x, policy='color,translation,cutout')
-
-        # If extra channels are present, merge them into the RGB channels.
-        if self.extra_channels > 0 and x.shape[1] > 3:
-            # Print debug information.
-            extra_in = x.shape[1] - 3
-            #print(f"[DEBUG] Input x has {x.shape[1]} channels; merging extra {extra_in} channel(s).")
-            expected_total = 3 + self.extra_channels
-            if x.shape[1] != expected_total:
-                x_img = x[:, :3]
-            # Take the first extra_channels from the rest.
-            x_bb = x[:, 3:3+self.extra_channels]
-            if self.bb_conv is not None:
-                bb_3 = self.bb_conv(x_bb)
+    # Determine whether bbox_mask_path is a single file or a directory.
+    mask_files = None
+    if bbox_mask_path is not None:
+        if os.path.isdir(bbox_mask_path):
+            mask_files = sorted([
+                os.path.join(bbox_mask_path, f)
+                for f in os.listdir(bbox_mask_path)
+                if f.lower().endswith('.png')
+            ])
+            if not mask_files:
+                print(f'Warning: No PNG files found in directory "{bbox_mask_path}". Proceeding without a bb_mask.')
             else:
-                bb_3 = x_bb[:, :3]
-            x = x_img + bb_3
-            #print("[DEBUG] After merging, x shape:", x.shape)
+                print(f'Using bounding box masks from directory: {mask_files}')
+        else:
+            mask_files = [bbox_mask_path]
+            print(f'Loading bounding box mask from file: {bbox_mask_path}')
 
-        # If interpolation to 224 is enabled, resize the image.
-        if self.interp224:
-            x = F.interpolate(x, 224, mode='bilinear', align_corners=False)
+    # Generate images for each seed.
+    for seed_idx, seed in enumerate(seeds):
+        print(f'Generating image for seed {seed} ({seed_idx+1}/{len(seeds)})...')
+        # Generate latent vector z (float32).
+        z = torch.from_numpy(np.random.RandomState(seed).randn(1, G.z_dim).astype(np.float32)).to(device)
 
-        # Extract feature maps.
-        features = self.feature_network(x)
+        # If the generator uses a stylegan-like input transform, apply rotation/translation.
+        if hasattr(G.synthesis, 'input'):
+            m = make_transform(translate, rotate)
+            m = np.linalg.inv(m)
+            G.synthesis.input.transform.copy_(torch.from_numpy(m).to(device))
 
-        # Compute final logits with the multi-scale discriminator.
-        logits = self.discriminator(features, c)
-        return logits
+        # If mask_files exists, load the appropriate mask for this seed.
+        current_bb_mask = None
+        if mask_files is not None:
+            mask_file = mask_files[seed_idx % len(mask_files)]
+            print(f'Loading bounding box mask from "{mask_file}" for seed {seed}...')
+            mask_img = PIL.Image.open(mask_file).convert('L')
+            # If needed, resize the mask to match the generator resolution:
+            # mask_img = mask_img.resize((G.img_resolution, G.img_resolution), PIL.Image.NEAREST)
+            mask = np.array(mask_img, dtype=np.float32)
+            mask = mask / 255.0  # scale to [0,1]
+            current_bb_mask = torch.from_numpy(mask).unsqueeze(0).unsqueeze(0).to(device)
+
+        # Generate the image, passing the bb_mask (or None) to the generator.
+        img = G(z, label, truncation_psi=truncation_psi, noise_mode=noise_mode, bb_mask=current_bb_mask)
+
+        # Convert the image tensor to a PIL image.
+        img = (img * 127.5 + 128).clamp(0, 255).to(torch.uint8)  # [N, C, H, W]
+        img = img[0].permute(1, 2, 0).cpu().numpy()  # [H, W, C]
+        out_path = os.path.join(outdir, f'seed{seed:04d}.png')
+        PIL.Image.fromarray(img, 'RGB').save(out_path)
+        print(f'Saved image: {out_path}')
+
+    # List files in the output directory for confirmation.
+    print("Files in output directory:")
+    for file in sorted(os.listdir(outdir)):
+        print(file)
+
+# ----------------------------------------------------------------------------
+if __name__ == "__main__":
+    generate_images()  # pylint: disable=no-value-for-parameter
